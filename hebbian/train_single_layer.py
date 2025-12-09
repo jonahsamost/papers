@@ -38,26 +38,15 @@ test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=True)
 
 
 def visualize_weights(weights, title="Learned Weights", filename="weights.png"):
-    # 1. Convert to numpy
     weights = weights.cpu().detach().numpy()
-    
-    # 2. Determine Auto-Scale Range
-    # We find the strongest value in the entire set to keep the scale consistent
-    # relative to 0. This ensures 0 is always white.
     max_val = np.max(np.abs(weights)) 
-    
-    # Avoid division by zero errors if weights are dead
     if max_val < 1e-9: max_val = 1.0 
     
     fig, axes = plt.subplots(4, 5, figsize=(10, 8))
     
     for i, ax in enumerate(axes.flat):
         if i < len(weights):
-            # Reshape
             img = weights[i].reshape(28, 28)
-            
-            # Plot with DYNAMIC SCALING
-            # We use vmin=-max_val and vmax=max_val to center 0 at white
             ax.imshow(img, cmap='seismic', vmin=-max_val, vmax=max_val)
             ax.axis('off')
             
@@ -68,21 +57,10 @@ def visualize_weights(weights, title="Learned Weights", filename="weights.png"):
     print(f"Saved visualization to {filename} (Range: +/- {max_val:.4f})")
 
 
-all_data = []
-for data, _ in train_loader:
-    all_data.append(data)
-    if len(all_data) * BATCH_SIZE >= HIDDEN_UNITS:
-        break
-
-# Stack and slice exactly 2000 images
-init_data = torch.cat(all_data, dim=0)[:HIDDEN_UNITS].to(device)
-
-# 2. Initialize the layer with these "Seeds"
 bio_layer = KHLayer(
     28 * 28, 
     HIDDEN_UNITS, 
     p_norm=P_NORM, 
-    # data_sample=init_data
 ).to(device)
 # bio = KHDeep(28 * 28).to(device)
 for epoch in range(EPOCHS_UNSUPERVISED):

@@ -4,7 +4,10 @@ import torch.nn.functional as F
 
 
 class KHLayer(nn.Module):
-    def __init__(self, input_dim, output_dim, p_norm=2, data_sample=None):
+    def __init__(
+        self, input_dim, output_dim,
+        p_norm=2, data_sample=None, k=3, bias_scale=4.0
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -18,8 +21,8 @@ class KHLayer(nn.Module):
         self.normalize_weights()
         
         self.register_buffer('win_counts', torch.ones(output_dim) / output_dim)
-        self.bias_strength = 4.0 * output_dim 
-        self.k = 3
+        self.bias_strength = bias_scale * output_dim 
+        self.k = k
         self.delta = 0.0
 
     def normalize_weights(self):
@@ -77,26 +80,46 @@ class KHLayer(nn.Module):
 
 
 class KHDeep(nn.Module):
-    def __init__(self, input_dim, hidden_dims: list = None):
+    def __init__(self, input_dim, hidden_dims: list = None, k_range=(15, 12), bias_range=(2.0, 10.0)):
         super().__init__()
         if not hidden_dims:
-            hidden_dims = [1024, 512, 256, 128]
+            hidden_dims = [128, 128, 128, 128]
+        
+        num_layers = len(hidden_dims)
         hidden_dims.insert(0, input_dim)
-        self.hidden_dims = hidden_dims
-        self.layers = nn.Sequential(
-            *[
-                KHLayer(i, o)
-                for i, o in zip(hidden_dims[:-1], hidden_dims[1:])
-            ]
-        )
+        
+        k_values = torch.linspace(k_range[0], k_range[1], steps=num_layers).long().tolist()
+        bias_values = torch.linspace(bias_range[0], bias_range[1], steps=num_layers).tolist()
+        
+        layers = []
+        for i in range(num_layers):
+            dim_in = hidden_dims[i]
+            dim_out = hidden_dims[i+1]
+            
+            layer = KHLayer(
+                dim_in, dim_out, 
+                k=k_values[i], bias_scale=bias_values[i]
+            )
+            layers.append(layer)
+            
+        self.layers = nn.Sequential(*layers)
     
     def forward(self, x):
-        return self.layers(x)
+        for i, layer in enumerate(self.layers):
+            if i == 0:
+                x = layer(x)
+            else:
+                x = x + layer(x)
+        return x
     
     def unsupervised_update(self, inputs, lr, delta):
         x = inputs
-        for layer in self.layers:
-            x = layer.unsupervised_update(x, lr, delta)
+        for i, layer in enumerate(self.layers):
+            layer_out = layer.unsupervised_update(x, lr, delta)
+            if i == 0:
+                x = layer_out
+            else:
+                x = x + layer_out
 
 
 class FullNetworkDeep(nn.Module):
