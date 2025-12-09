@@ -38,7 +38,7 @@ class RolloutsDataset(IterableDataset):
 
 
 class SequenceDataset(IterableDataset):
-    def __init__(self, data_dir="data/rollouts", seq_len=32, buffer_size=100):
+    def __init__(self, data_dir="data/rollouts", seq_len=64, buffer_size=100):
         self.files = list(Path(data_dir).glob('*.npz'))
         self.seq_len = seq_len
         self.buffer_size = buffer_size

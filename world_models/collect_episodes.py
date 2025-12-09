@@ -9,6 +9,30 @@ NUM_ROLLOUTS = 10_000
 DATA_DIR = "data/rollouts"
 os.makedirs(DATA_DIR, exist_ok=True)
 
+
+def teleport_to_random_track_position(env):
+    raw_env = env.unwrapped
+    if not hasattr(raw_env, 'track') or len(raw_env.track) == 0:
+        return
+        
+    track_idx = np.random.randint(0, len(raw_env.track))
+    _, beta, x, y = raw_env.track[track_idx]
+    
+    if raw_env.car is None:
+        return
+
+    raw_env.car.hull.position = (x, y)
+    raw_env.car.hull.angle = beta
+    
+    raw_env.car.hull.linearVelocity = (0, 0)
+    raw_env.car.hull.angularVelocity = 0
+    
+    for wheel in raw_env.car.wheels:
+        wheel.position = (x, y)
+        wheel.linearVelocity = (0, 0)
+        wheel.angularVelocity = 0
+
+
 def collect_one_episode(episode_id):
     try:
         env = gym.make(
@@ -17,6 +41,7 @@ def collect_one_episode(episode_id):
         )
         
         obs, _ = env.reset()
+        teleport_to_random_track_position(env)
         done = False
         
         episode_obs = []
@@ -24,17 +49,17 @@ def collect_one_episode(episode_id):
         episode_dones = []
         
         cnt = 0
-        action = env.action_space.sample()
+        action = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         while not done:
             action[0] += np.random.normal(0, 0.2) # Steer noise
-            action[1] += np.random.normal(0, 0.1) # Gas noise
+            action[1] += np.random.normal(0.05, 0.1) # Gas noise
             action[2] = 0 # Disable brake for collection usually helps coverage
             
             action[0] = np.clip(action[0], -1.0, 1.0) # Steer
             action[1] = np.clip(action[1], 0.0, 1.0)  # Gas
 
             episode_obs.append(obs)
-            episode_actions.append(action)
+            episode_actions.append(action.copy())
             obs, reward, terminated, truncated, _ = env.step(action)
             cnt += 1
             done = terminated or truncated
@@ -67,4 +92,4 @@ def run_parallel_collection(total_episodes):
                 print(f"Collected {cnt}/{total_episodes} episodes...", end='\r')
 
 
-run_parallel_collection(10000)
+# `run_parallel_collection(10000)

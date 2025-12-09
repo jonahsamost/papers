@@ -62,7 +62,7 @@ class VAE(nn.Module):
                 hidden_dims[0], in_channels,
                 kernel_size=self.kernel_size, stride=1, padding=self.padding
             ),
-            nn.Tanh()
+            nn.Sigmoid()
         )
 
         hw = math.ceil(self.in_height_width / (2 ** len(hidden_dims)))
@@ -130,6 +130,8 @@ class MDN_RNN(nn.Module):
         self.fc_pi = nn.Linear(hidden_size, num_guassians)
         self.fc_sigma = nn.Linear(hidden_size, num_guassians * latent_dim)
         self.fc_mu = nn.Linear(hidden_size, num_guassians * latent_dim)
+        nn.init.constant_(self.fc_sigma.bias, -0.5)
+        nn.init.constant_(self.fc_pi.bias, 0.0)
     
     def get_initial_state(self, batch_size):
         device = next(self.parameters()).device

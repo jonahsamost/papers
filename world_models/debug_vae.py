@@ -57,3 +57,6 @@ def visualize_vae():
     plt.tight_layout()
     plt.savefig("vae_debug.png")
     print("Saved visualization to vae_debug.png")
+
+
+visualize_vae()
