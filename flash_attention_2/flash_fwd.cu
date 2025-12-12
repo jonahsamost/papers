@@ -8,203 +8,203 @@ nvcc -arch=sm_89 -o out test.cu
 #include <cstdlib>
 #include <ctime>
 
- #include <cuda_runtime.h>
- #include <cuda_fp16.h>
- #include <mma.h>
- #include <stdio.h>
- #include <math.h>
- 
- using namespace nvcuda;
- 
- #define BR 64
- #define BC 64
- #define WARP_SIZE 32
- #define WARPS_PER_BLOCK 4
- #define THREADS_PER_BLOCK (WARP_SIZE * WARPS_PER_BLOCK)
- #define WMMA 16
- 
- #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <mma.h>
+#include <stdio.h>
+#include <math.h>
 
- 
- __global__ void flash_attn_fwd_kernel(
-     const half* __restrict__ Q, 
-     const half* __restrict__ K, 
-     const half* __restrict__ V, 
-     half* __restrict__ O, 
-     int N, 
-     int d
- ) {
-    extern __shared__ half smem[];
-    
-    half* sQ = smem;
-    half* sK = sQ + (BR * d);
-    half* sV = sK + (BC * d);
-    half* sS = sV + (BC * d);
-    half* sO_scratch = sS + (BR * BC);
- 
-    int tx = threadIdx.x;
-    int warp_id = tx / WARP_SIZE;
-    int lane_id = tx % WARP_SIZE;
- 
-    int q_row_start = warp_id * WMMA; 
- 
-    int batch_head_offset = blockIdx.z * N * d;
-    int q_base_offset = batch_head_offset + (blockIdx.x * BR * d);
- 
-    wmma::fragment<wmma::accumulator, WMMA, WMMA, WMMA, half> acc_O[8];
-    for(int i=0; i < (d / WMMA); i++) {
-        wmma::fill_fragment(acc_O[i], 0.0);
-    }
- 
-    float m_prev = -INFINITY;
-    float l_prev = 0.0f;
- 
-    for (int i = tx; i < BR * d; i += blockDim.x) {
-        sQ[i] = Q[q_base_offset + i]; 
-    }
-    __syncthreads();
- 
-    int num_blocks_kv = CEIL_DIV(N, BC);
-    for (int j = 0; j < num_blocks_kv; j++) {
-        int kv_base_offset = batch_head_offset + (j * BC * d);
+using namespace nvcuda;
+
+#define BR 64
+#define BC 64
+#define WARP_SIZE 32
+#define WARPS_PER_BLOCK 4
+#define THREADS_PER_BLOCK (WARP_SIZE * WARPS_PER_BLOCK)
+#define WMMA 16
+
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+
+
+__global__ void flash_attn_fwd_kernel(
+    const half* __restrict__ Q, 
+    const half* __restrict__ K, 
+    const half* __restrict__ V, 
+    half* __restrict__ O, 
+    int N, 
+    int d
+) {
+   extern __shared__ half smem[];
+   
+   half* sQ = smem;
+   half* sK = sQ + (BR * d);
+   half* sV = sK + (BC * d);
+   half* sS = sV + (BC * d);
+   half* sO_scratch = sS + (BR * BC);
+
+   int tx = threadIdx.x;
+   int warp_id = tx / WARP_SIZE;
+   int lane_id = tx % WARP_SIZE;
+
+   int q_row_start = warp_id * WMMA; 
+
+   int batch_head_offset = blockIdx.z * N * d;
+   int q_base_offset = batch_head_offset + (blockIdx.x * BR * d);
+
+   wmma::fragment<wmma::accumulator, WMMA, WMMA, WMMA, half> acc_O[8];
+   for(int i=0; i < (d / WMMA); i++) {
+       wmma::fill_fragment(acc_O[i], 0.0);
+   }
+
+   float m_prev = -INFINITY;
+   float l_prev = 0.0f;
+
+   for (int i = tx; i < BR * d; i += blockDim.x) {
+       sQ[i] = Q[q_base_offset + i]; 
+   }
+   __syncthreads();
+
+   int num_blocks_kv = CEIL_DIV(N, BC);
+   for (int j = 0; j < num_blocks_kv; j++) {
+       int kv_base_offset = batch_head_offset + (j * BC * d);
+       
+       __syncthreads();
+       for (int i = tx; i < BC * d; i += blockDim.x) {
+           sK[i] = K[kv_base_offset + i];
+           sV[i] = V[kv_base_offset + i];
+       }
+       __syncthreads();
+
+       for (int s_col_tile = 0; s_col_tile < (BC / WMMA); s_col_tile++) {
+           wmma::fragment<wmma::accumulator, WMMA, WMMA, WMMA, half> acc_S;
+           wmma::fill_fragment(acc_S, 0.0);
+
+           for (int d_iter = 0; d_iter < (d / WMMA); d_iter++) {
+               
+               wmma::fragment<wmma::matrix_a, WMMA, WMMA, WMMA, half, wmma::row_major> frag_Q;
+               wmma::fragment<wmma::matrix_b, WMMA, WMMA, WMMA, half, wmma::col_major> frag_K;
+
+               int q_offset = (q_row_start * d) + (d_iter * WMMA);
+               wmma::load_matrix_sync(frag_Q, &sQ[q_offset], d);
+
+               int k_offset = (s_col_tile * WMMA * d) + (d_iter * WMMA); 
+               wmma::load_matrix_sync(frag_K, &sK[k_offset], d);
+
+               wmma::mma_sync(acc_S, frag_Q, frag_K, acc_S);
+           }
+
+           int s_store_offset = (q_row_start * BC) + (s_col_tile * WMMA);
+           wmma::store_matrix_sync(&sS[s_store_offset], acc_S, BC, wmma::mem_row_major);
+       }
         
-        __syncthreads();
-        for (int i = tx; i < BC * d; i += blockDim.x) {
-            sK[i] = K[kv_base_offset + i];
-            sV[i] = V[kv_base_offset + i];
-        }
-        __syncthreads();
- 
-        for (int s_col_tile = 0; s_col_tile < (BC / WMMA); s_col_tile++) {
-            wmma::fragment<wmma::accumulator, WMMA, WMMA, WMMA, half> acc_S;
-            wmma::fill_fragment(acc_S, 0.0);
- 
-            for (int d_iter = 0; d_iter < (d / WMMA); d_iter++) {
-                
-                wmma::fragment<wmma::matrix_a, WMMA, WMMA, WMMA, half, wmma::row_major> frag_Q;
-                wmma::fragment<wmma::matrix_b, WMMA, WMMA, WMMA, half, wmma::col_major> frag_K;
- 
-                int q_offset = (q_row_start * d) + (d_iter * WMMA);
-                wmma::load_matrix_sync(frag_Q, &sQ[q_offset], d);
- 
-                int k_offset = (s_col_tile * WMMA * d) + (d_iter * WMMA); 
-                wmma::load_matrix_sync(frag_K, &sK[k_offset], d);
- 
-                wmma::mma_sync(acc_S, frag_Q, frag_K, acc_S);
-            }
- 
-            int s_store_offset = (q_row_start * BC) + (s_col_tile * WMMA);
-            wmma::store_matrix_sync(&sS[s_store_offset], acc_S, BC, wmma::mem_row_major);
-        }
-         
-        __syncthreads();
- 
-        if (j > 0) {
-            for (int i = 0; i < (d / WMMA); i++) {
-                int o_store_offset = (q_row_start * d) + (i * WMMA);
-                wmma::store_matrix_sync(&sO_scratch[o_store_offset], acc_O[i], d, wmma::mem_row_major);
-            }
-        }
-        __syncthreads();
- 
-        if (lane_id < 16) { 
-            // find max and rescale 
-            int my_row = q_row_start + lane_id;
- 
-            float m_curr = -INFINITY;
-            for (int c = 0; c < BC; c++) {
-                float val = __half2float(sS[my_row * BC + c]);
-                if (val > m_curr) m_curr = val;
-            }
- 
-            float m_new = fmaxf(m_prev, m_curr);
-            float o_scale = (j == 0) ? 1.0f : expf(m_prev - m_new);
-            
-            if (j > 0) {
-                for (int x = 0; x < d; x++) {
-                    half val = sO_scratch[my_row * d + x];
-                    sO_scratch[my_row * d + x] = __float2half(__half2float(val) * o_scale);
-                }
-            }
- 
-            float l_curr = 0.0f;
-            for (int c = 0; c < BC; c++) {
-                // rescale current chunk
-                float val = __half2float(sS[my_row * BC + c]);
-                float p = expf(val - m_new);
-                sS[my_row * BC + c] = __float2half(p);
-                l_curr += p;
-            }
- 
-            l_prev = (l_prev * o_scale) + l_curr; // rescale row sum
-            m_prev = m_new;
-        }
-        __syncthreads();
- 
-        if (j > 0) {
-            for (int i = 0; i < (d / WMMA); i++) {
-                int o_load_offset = (q_row_start * d) + (i * WMMA);
-                wmma::load_matrix_sync(acc_O[i], &sO_scratch[o_load_offset], d, wmma::mem_row_major);
-            }
-        }
- 
-        for (int o_col_tile = 0; o_col_tile < (d / WMMA); o_col_tile++) {
-            for (int v_iter = 0; v_iter < (BC / WMMA); v_iter++) {
-                wmma::fragment<wmma::matrix_a, WMMA, WMMA, WMMA, half, wmma::row_major> frag_P;
-                wmma::fragment<wmma::matrix_b, WMMA, WMMA, WMMA, half, wmma::row_major> frag_V;
- 
-                int p_offset = (q_row_start * BC) + (v_iter * WMMA);
-                wmma::load_matrix_sync(frag_P, &sS[p_offset], BC);
- 
-                int v_offset = (v_iter * WMMA * d) + (o_col_tile * WMMA);
-                wmma::load_matrix_sync(frag_V, &sV[v_offset], d);
- 
-                wmma::mma_sync(acc_O[o_col_tile], frag_P, frag_V, acc_O[o_col_tile]);
-            }
-        }
- 
-    }
- 
-    for (int i = 0; i < (d / WMMA); i++) {
-        int o_store_offset = (q_row_start * d) + (i * WMMA);
-        wmma::store_matrix_sync(&sO_scratch[o_store_offset], acc_O[i], d, wmma::mem_row_major);
-    }
-    __syncthreads();
- 
-    if (lane_id < 16) {
-        // renormalize by running sum
-        int my_row = q_row_start + lane_id;
-        float inv_l = 1.0f / l_prev;
-        
-        for (int x = 0; x < d; x++) {
-            float val = __half2float(sO_scratch[my_row * d + x]);
-            sO_scratch[my_row * d + x] = __float2half(val * inv_l);
-        }
-    }
-    __syncthreads();
- 
-    int output_base = batch_head_offset + (blockIdx.x * BR * d);
-    for (int i = tx; i < BR * d; i += blockDim.x) {
-        O[output_base + i] = sO_scratch[i];
-    }
- }
- 
- void flash_attn_fwd(const half* Q, const half *K, const half *V, half *output, 
-                     int batch, int heads, int N, int d) {
- 
-    dim3 grid(CEIL_DIV(N, BR), 1, batch * heads);
- 
-    size_t total_smem = sizeof(half) * (BR * d * 2 + BC * d * 2 + BC * BR);
-    // more shmem
-    cudaFuncSetAttribute(flash_attn_fwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
- 
-    flash_attn_fwd_kernel<<<grid, THREADS_PER_BLOCK, total_smem>>>(Q, K, V, output, N, d);
-    
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA Error: %s\n", cudaGetErrorString(err));
-    }
- }
+       __syncthreads();
+
+       if (j > 0) {
+           for (int i = 0; i < (d / WMMA); i++) {
+               int o_store_offset = (q_row_start * d) + (i * WMMA);
+               wmma::store_matrix_sync(&sO_scratch[o_store_offset], acc_O[i], d, wmma::mem_row_major);
+           }
+       }
+       __syncthreads();
+
+       if (lane_id < 16) { 
+           // find max and rescale 
+           int my_row = q_row_start + lane_id;
+
+           float m_curr = -INFINITY;
+           for (int c = 0; c < BC; c++) {
+               float val = __half2float(sS[my_row * BC + c]);
+               if (val > m_curr) m_curr = val;
+           }
+
+           float m_new = fmaxf(m_prev, m_curr);
+           float o_scale = (j == 0) ? 1.0f : expf(m_prev - m_new);
+           
+           if (j > 0) {
+               for (int x = 0; x < d; x++) {
+                   half val = sO_scratch[my_row * d + x];
+                   sO_scratch[my_row * d + x] = __float2half(__half2float(val) * o_scale);
+               }
+           }
+
+           float l_curr = 0.0f;
+           for (int c = 0; c < BC; c++) {
+               // rescale current chunk
+               float val = __half2float(sS[my_row * BC + c]);
+               float p = expf(val - m_new);
+               sS[my_row * BC + c] = __float2half(p);
+               l_curr += p;
+           }
+
+           l_prev = (l_prev * o_scale) + l_curr; // rescale row sum
+           m_prev = m_new;
+       }
+       __syncthreads();
+
+       if (j > 0) {
+           for (int i = 0; i < (d / WMMA); i++) {
+               int o_load_offset = (q_row_start * d) + (i * WMMA);
+               wmma::load_matrix_sync(acc_O[i], &sO_scratch[o_load_offset], d, wmma::mem_row_major);
+           }
+       }
+
+       for (int o_col_tile = 0; o_col_tile < (d / WMMA); o_col_tile++) {
+           for (int v_iter = 0; v_iter < (BC / WMMA); v_iter++) {
+               wmma::fragment<wmma::matrix_a, WMMA, WMMA, WMMA, half, wmma::row_major> frag_P;
+               wmma::fragment<wmma::matrix_b, WMMA, WMMA, WMMA, half, wmma::row_major> frag_V;
+
+               int p_offset = (q_row_start * BC) + (v_iter * WMMA);
+               wmma::load_matrix_sync(frag_P, &sS[p_offset], BC);
+
+               int v_offset = (v_iter * WMMA * d) + (o_col_tile * WMMA);
+               wmma::load_matrix_sync(frag_V, &sV[v_offset], d);
+
+               wmma::mma_sync(acc_O[o_col_tile], frag_P, frag_V, acc_O[o_col_tile]);
+           }
+       }
+
+   }
+
+   for (int i = 0; i < (d / WMMA); i++) {
+       int o_store_offset = (q_row_start * d) + (i * WMMA);
+       wmma::store_matrix_sync(&sO_scratch[o_store_offset], acc_O[i], d, wmma::mem_row_major);
+   }
+   __syncthreads();
+
+   if (lane_id < 16) {
+       // renormalize by running sum
+       int my_row = q_row_start + lane_id;
+       float inv_l = 1.0f / l_prev;
+       
+       for (int x = 0; x < d; x++) {
+           float val = __half2float(sO_scratch[my_row * d + x]);
+           sO_scratch[my_row * d + x] = __float2half(val * inv_l);
+       }
+   }
+   __syncthreads();
+
+   int output_base = batch_head_offset + (blockIdx.x * BR * d);
+   for (int i = tx; i < BR * d; i += blockDim.x) {
+       O[output_base + i] = sO_scratch[i];
+   }
+}
+
+void flash_attn_fwd(const half* Q, const half *K, const half *V, half *output, 
+                    int batch, int heads, int N, int d) {
+
+   dim3 grid(CEIL_DIV(N, BR), 1, batch * heads);
+
+   size_t total_smem = sizeof(half) * (BR * d * 2 + BC * d * 2 + BC * BR);
+   // more shmem
+   cudaFuncSetAttribute(flash_attn_fwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+
+   flash_attn_fwd_kernel<<<grid, THREADS_PER_BLOCK, total_smem>>>(Q, K, V, output, N, d);
+   
+   cudaError_t err = cudaGetLastError();
+   if (err != cudaSuccess) {
+       printf("CUDA Error: %s\n", cudaGetErrorString(err));
+   }
+}
 
 
 
