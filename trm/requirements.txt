@@ -1,0 +1,8 @@
+torch
+numpy
+pydantic
+tqdm
+huggingface-hub
+einops
+argdantic
+setuptools
