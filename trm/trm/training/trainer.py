@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from torch.amp import GradScaler, autocast
 
 from trm.models.trm import TRM
 from trm.models.losses import ACTLossHead
@@ -64,15 +65,17 @@ scheduler = get_scheduler(
     optimizer, warmup_steps=2000, total_steps=TOTAL_STEPS, min_lr_ratio=0.1
 )
 iterator = get_iterator(dataloader)
+autocast_ctx = autocast(device_type=device_type , dtype=torch.bfloat16)
 train_state = TrainState(
     model=model,
     optimizer=optimizer,
     scheduler=scheduler,
+    autocast_ctx=autocast_ctx,
     carry=None,
     step=0,
     total_steps=TOTAL_STEPS,
     epoch=0,
-    total_epochs=EPOCHS
+    total_epochs=EPOCHS,
 )
 model.train()
 

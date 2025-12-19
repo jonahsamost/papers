@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from torch.utils.checkpoint import checkpoint
 
 from typing import Dict
 
@@ -135,9 +136,28 @@ class TRM_inner(nn.Module):
                     z_L = self.transformer(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.transformer(z_H, z_L, **seq_info)
 
+        # Gradient checkpointing for the training iterations to save memory
+        # Create wrapper functions that checkpoint can use
+        def transformer_L(x, y):
+            return self.transformer(x, y, **seq_info)
+        
+        def transformer_H(x, y):
+            return self.transformer(x, y, **seq_info)
+        
+        # Wrap each transformer call to trade compute for memory
         for _il in range(self.config.L_steps):
-            z_L = self.transformer(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.transformer(z_H, z_L, **seq_info)
+            z_L = checkpoint(
+                transformer_L,
+                z_L,
+                z_H + input_embeddings,
+                use_reentrant=False,  # More efficient, works better with autograd
+            )
+        z_H = checkpoint(
+            transformer_H,
+            z_H,
+            z_L,
+            use_reentrant=False,
+        )
 
         new_carry = TRM_carry(z_H=z_H.detach(), z_L=z_L.detach())
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]

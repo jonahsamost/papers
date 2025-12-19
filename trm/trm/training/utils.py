@@ -5,6 +5,8 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import LambdaLR
 from typing import Any, Sequence
 from dataclasses import dataclass
+from torch.amp import GradScaler, autocast
+
 
 
 @dataclass
@@ -12,6 +14,7 @@ class TrainState:
     model: nn.Module
     optimizer: torch.optim.Optimizer
     scheduler: torch.optim.lr_scheduler.LambdaLR
+    autocast_ctx: torch.amp.autocast_mode.autocast
     carry: Any
     step: int
     total_steps: int
@@ -78,18 +81,37 @@ def train_batch(config, train_state, batch, global_batch_size: int):
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)
 
+    # Memory tracking
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        mem_before = torch.cuda.memory_allocated() / 1024**2  # MB
+
     train_state.optimizer.zero_grad()
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    with train_state.autocast_ctx:
+        train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
     ((1 / global_batch_size) * loss).backward()
     train_state.optimizer.step()
     train_state.scheduler.step()
     train_state.step += 1
 
-    if train_state.step % 100 == 0:
+    # Memory stats after training step
+    if torch.cuda.is_available():
+        mem_after = torch.cuda.memory_allocated() / 1024**2  # MB
+        mem_peak = torch.cuda.max_memory_allocated() / 1024**2  # MB
+        mem_reserved = torch.cuda.memory_reserved() / 1024**2  # MB
+        mem_peak_reserved = torch.cuda.max_memory_reserved() / 1024**2  # MB
+        mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**2  # MB
+
+    # Print memory stats (change condition to see every step: train_state.step % 1 == 0)
+    if train_state.step % 100 == 0 or train_state.step == 1:
         current_lr = train_state.scheduler.get_last_lr()[0]
         total = train_state.total_steps
         epoch = train_state.epoch
         total_epochs = train_state.total_epochs
         print(f"Step {train_state.step}/{total}, Epoch {epoch}/{total_epochs}, LR: {current_lr:.2e}")
+        if torch.cuda.is_available():
+            peak_pct = (mem_peak / mem_total) * 100
+            print(f"  Memory: allocated={mem_after:.1f}MB, peak={mem_peak:.1f}MB ({peak_pct:.1f}%), reserved={mem_reserved:.1f}MB, peak_reserved={mem_peak_reserved:.1f}MB, total={mem_total:.1f}MB")
 
