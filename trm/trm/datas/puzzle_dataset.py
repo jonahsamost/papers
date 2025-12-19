@@ -9,7 +9,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 # from trm.models.losses import IGNORE_LABEL_ID
 IGNORE_LABEL_ID = -100
-from trm.data.common import PuzzleDatasetMetadata
+from trm.datas.common import PuzzleDatasetMetadata
 
 from argdantic import ArgParser
 from pydantic import BaseModel

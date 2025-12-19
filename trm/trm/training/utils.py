@@ -11,7 +11,12 @@ from dataclasses import dataclass
 class TrainState:
     model: nn.Module
     optimizer: torch.optim.Optimizer
+    scheduler: torch.optim.lr_scheduler.LambdaLR
     carry: Any
+    step: int
+    total_steps: int
+    epoch: int
+    total_epochs: int
 
 
 def get_optimizer(model, dataset_type="sudoku"):
@@ -71,11 +76,20 @@ def train_batch(config, train_state, batch, global_batch_size: int):
     # Init carry if it is None
     if train_state.carry is None:
         with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+            train_state.carry = train_state.model.initial_carry(batch)
 
     train_state.optimizer.zero_grad()
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
     ((1 / global_batch_size) * loss).backward()
     train_state.optimizer.step()
+    train_state.scheduler.step()
+    train_state.step += 1
+
+    if train_state.step % 100 == 0:
+        current_lr = train_state.scheduler.get_last_lr()[0]
+        total = train_state.total_steps
+        epoch = train_state.epoch
+        total_epochs = train_state.total_epochs
+        print(f"Step {train_state.step}/{total}, Epoch {epoch}/{total_epochs}, LR: {current_lr:.2e}")
 

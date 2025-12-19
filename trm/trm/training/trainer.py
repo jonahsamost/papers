@@ -25,11 +25,14 @@ LR = 1e-4
 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_type)
 trm = TRM(config)
-model = ACTLossHead(trm, 'stablemax_cross_entropy')
+model = ACTLossHead(trm, 'stablemax_cross_entropy').to(device)
 
+# Only preprocess data if it doesn't exist
 data_config = DataProcessConfig()
-convert_subset('train', data_config)
-convert_subset('test', data_config)
+if not os.path.exists(os.path.join(data_config.output_dir, "train", "dataset.json")):
+    convert_subset('train', data_config)
+if not os.path.exists(os.path.join(data_config.output_dir, "test", "dataset.json")):
+    convert_subset('test', data_config)
 
 EPOCHS = 60000
 BATCH_SIZE = 768
@@ -64,9 +67,19 @@ iterator = get_iterator(dataloader)
 train_state = TrainState(
     model=model,
     optimizer=optimizer,
-    carry=None
+    scheduler=scheduler,
+    carry=None,
+    step=0,
+    total_steps=TOTAL_STEPS,
+    epoch=0,
+    total_epochs=EPOCHS
 )
 model.train()
+
 for epoch in range(EPOCHS):
-    set_name, batch, global_batch_size = next(iterator)
-    train_batch(config, train_state, batch, global_batch_size)
+    try:
+        set_name, batch, global_batch_size = next(iterator)
+        train_batch(config, train_state, batch, global_batch_size)
+        
+    except StopIteration:
+        break

@@ -8,7 +8,7 @@ from typing import Dict
 
 from trm.models.layers import (
     Block, RotaryEmbedding,
-    CastedLinear, CastedEmbedding,
+    CastedLinear, CastedEmbedding, CastedSparseEmbedding,
     trunc_normal_init_
 )
 
@@ -54,9 +54,22 @@ class TRM_inner(nn.Module):
         )
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.q_head = CastedLinear(config.n_embd, 2, bias=True)
+        
+        # Calculate puzzle_emb_len from puzzle_emb_ndim if not specified
+        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.n_embd) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
+        if self.config.puzzle_emb_ndim > 0:
+            # Zero init puzzle embeddings
+            self.puzzle_emb = CastedSparseEmbedding(
+                self.config.num_puzzle_identifiers, 
+                self.config.puzzle_emb_ndim,
+                batch_size=self.config.batch_size, 
+                init_std=0, 
+                cast_to=self.forward_dtype
+            )
+        
         self.rotary_emb = RotaryEmbedding(
             dim=config.n_embd // config.n_head,
-            max_position_embeddings=config.sequence_len + config.puzzle_emb_len,
+            max_position_embeddings=config.sequence_len + self.puzzle_emb_len,
             base=config.rope_theta
         )
 
@@ -70,14 +83,31 @@ class TRM_inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
     
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+        # Token embedding
+        embedding = self.emb(input.to(torch.int32))
+
+        # Puzzle embeddings
+        if self.config.puzzle_emb_ndim > 0:
+            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
+            
+            pad_count = self.puzzle_emb_len * self.config.n_embd - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+
+            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.n_embd), embedding), dim=-2)
+
+        # Scale
+        return self.embed_scale * embedding
+    
     def empty_carry(self, batch_size):
         return TRM_carry(
             z_H = torch.empty(
-                batch_size, self.config.sequence_len + self.config.puzzle_emb_len,
+                batch_size, self.config.sequence_len + self.puzzle_emb_len,
                 self.config.n_embd, dtype=self.forward_dtype
             ),
             z_L = torch.empty(
-                batch_size, self.config.sequence_len + self.config.puzzle_emb_len,
+                batch_size, self.config.sequence_len + self.puzzle_emb_len,
                 self.config.n_embd, dtype=self.forward_dtype
             )
         )
@@ -94,21 +124,23 @@ class TRM_inner(nn.Module):
         seq_info = dict(
             cos_sin=cos_sin
         )
-        embds = self.emb(batch['inputs']) * self.embed_scale
+        
+        # Input encoding (handles puzzle embeddings if enabled)
+        input_embeddings = self._input_embeddings(batch['inputs'], batch.get('puzzle_identifiers', torch.zeros(batch['inputs'].shape[0], dtype=torch.int32)))
 
         z_L, z_H = carry.z_L, carry.z_H
         with torch.no_grad():
             for _ih in range(self.config.H_steps - 1):
                 for _il in range(self.config.L_steps):
-                    z_L = self.transformer(z_L, z_H + embds, **seq_info)
+                    z_L = self.transformer(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.transformer(z_H, z_L, **seq_info)
 
         for _il in range(self.config.L_steps):
-            z_L = self.transformer(z_L, z_H + embds, **seq_info)
+            z_L = self.transformer(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.transformer(z_H, z_L, **seq_info)
 
         new_carry = TRM_carry(z_H=z_H.detach(), z_L=z_L.detach())
-        output = self.lm_head(z_H)[:, self.config.puzzle_emb_len:]
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 

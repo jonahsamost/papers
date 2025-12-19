@@ -41,15 +41,24 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    out = torch.cat([y1, y2], 3) # re-assemble
-    out = out.to(x.dtype) # ensure input/output dtypes match
-    return out
+def rotate_half(x: torch.Tensor):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    # q, k: [bs, seq_len, num_heads, head_dim]
+    # cos, sin: [seq_len, head_dim]
+    orig_dtype = q.dtype
+    q = q.to(cos.dtype)
+    k = k.to(cos.dtype)
+
+    q_embed = (q * cos.unsqueeze(-2)) + (rotate_half(q) * sin.unsqueeze(-2))
+    k_embed = (k * cos.unsqueeze(-2)) + (rotate_half(k) * sin.unsqueeze(-2))
+
+    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
 
 
 class RotaryEmbedding(nn.Module):
@@ -93,7 +102,7 @@ class SelfAttention(nn.Module):
 
         # rotary embeddings
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # rms QK norm
         q, k = norm(q), norm(k)
@@ -180,3 +189,33 @@ class CastedEmbedding(nn.Module):
         
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.embedding(input, self.embedding_weight.to(self.cast_to))
+
+
+class CastedSparseEmbedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, batch_size: int, init_std: float, cast_to: torch.dtype):
+        super().__init__()
+        self.cast_to = cast_to
+
+        # Real Weights
+        # Truncated LeCun normal init
+        self.weights = nn.Buffer(
+            trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=init_std), persistent=True
+        )
+
+        # Local weights and IDs
+        # Local embeddings, with gradient, not persistent
+        self.local_weights = nn.Buffer(torch.zeros(batch_size, embedding_dim, requires_grad=True), persistent=False)
+        # Local embedding IDs, not persistent
+        self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int32), persistent=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            # Test mode, no gradient
+            return self.weights[inputs].to(self.cast_to)
+            
+        # Training mode, fill puzzle embedding from weights
+        with torch.no_grad():
+            self.local_weights.copy_(self.weights[inputs])
+            self.local_ids.copy_(inputs)
+
+        return self.local_weights.to(self.cast_to)
