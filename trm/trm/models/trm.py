@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.compiler
 from dataclasses import dataclass
 from torch.utils.checkpoint import checkpoint
 
@@ -32,10 +33,12 @@ class TRM_Blocks(nn.Module):
     def __init__(self, layers):
         super().__init__()
         self.layers = nn.ModuleList(layers)
+        # Compile individual blocks for performance without breaking the outer loop
+        self.compiled_layers = nn.ModuleList([torch.compile(layer) for layer in layers])
     
     def forward(self, x, y, **kwargs):
         x = x + y
-        for layer in self.layers:
+        for layer in self.compiled_layers:
             x = layer(x, **kwargs)
         return x
         
@@ -59,12 +62,11 @@ class TRM_inner(nn.Module):
         # Calculate puzzle_emb_len from puzzle_emb_ndim if not specified
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.n_embd) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
-            # Zero init puzzle embeddings
-            self.puzzle_emb = CastedSparseEmbedding(
+            # Init puzzle embeddings as a normal learnable embedding
+            self.puzzle_emb = CastedEmbedding(
                 self.config.num_puzzle_identifiers, 
                 self.config.puzzle_emb_ndim,
-                batch_size=self.config.batch_size, 
-                init_std=0, 
+                init_std=0.02, # Standard init for embeddings
                 cast_to=self.forward_dtype
             )
         
@@ -75,8 +77,8 @@ class TRM_inner(nn.Module):
         )
 
         self.transformer = TRM_Blocks([ Block(config, i) for i in range(config.n_layer) ])
-        self.register_buffer('H_init', trunc_normal_init_(torch.empty(config.n_embd, dtype=self.forward_dtype), std=1), persistent=True)
-        self.register_buffer('L_init', trunc_normal_init_(torch.empty(config.n_embd, dtype=self.forward_dtype), std=1), persistent=True)
+        self.H_init = nn.Parameter(trunc_normal_init_(torch.empty(config.n_embd, dtype=self.forward_dtype), std=1))
+        self.L_init = nn.Parameter(trunc_normal_init_(torch.empty(config.n_embd, dtype=self.forward_dtype), std=1))
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -119,7 +121,7 @@ class TRM_inner(nn.Module):
             z_L = torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L)
         )
 
-    
+    @torch.compiler.disable
     def forward(self, carry, batch):
         cos_sin = self.rotary_emb()
         seq_info = dict(
@@ -130,36 +132,34 @@ class TRM_inner(nn.Module):
         input_embeddings = self._input_embeddings(batch['inputs'], batch.get('puzzle_identifiers', torch.zeros(batch['inputs'].shape[0], dtype=torch.int32)))
 
         z_L, z_H = carry.z_L, carry.z_H
-        with torch.no_grad():
-            for _ih in range(self.config.H_steps - 1):
-                for _il in range(self.config.L_steps):
-                    z_L = self.transformer(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.transformer(z_H, z_L, **seq_info)
-
+        
         # Gradient checkpointing for the training iterations to save memory
         # Create wrapper functions that checkpoint can use
-        def transformer_L(x, y):
-            return self.transformer(x, y, **seq_info)
+        def transformer_block(x, y, cos, sin):
+            return self.transformer(x, y, cos_sin=(cos, sin))
         
-        def transformer_H(x, y):
-            return self.transformer(x, y, **seq_info)
-        
-        # Wrap each transformer call to trade compute for memory
-        for _il in range(self.config.L_steps):
-            z_L = checkpoint(
-                transformer_L,
+        cos, sin = cos_sin
+        # All iterations with gradients
+        for _ih in range(self.config.H_steps):
+            for _il in range(self.config.L_steps):
+                z_L = checkpoint(
+                    transformer_block,
+                    z_L,
+                    z_H + input_embeddings,
+                    cos,
+                    sin,
+                    use_reentrant=True,
+                )
+            z_H = checkpoint(
+                transformer_block,
+                z_H,
                 z_L,
-                z_H + input_embeddings,
-                use_reentrant=False,  # More efficient, works better with autograd
+                cos,
+                sin,
+                use_reentrant=True,
             )
-        z_H = checkpoint(
-            transformer_H,
-            z_H,
-            z_L,
-            use_reentrant=False,
-        )
 
-        new_carry = TRM_carry(z_H=z_H.detach(), z_L=z_L.detach())
+        new_carry = TRM_carry(z_H=z_H, z_L=z_L)
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
@@ -183,6 +183,7 @@ class TRM(nn.Module):
     def forward(self, carry, batch):
         new_carry = self.inner.reset_carry(carry.halted, carry.carry)
         new_steps = torch.where(carry.halted, 0, carry.steps)
+        # TODO change this so that were not skipping items in batches
         new_current_data = {
             k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v)
             for k, v in carry.current_data.items()
@@ -228,4 +229,6 @@ class TRM(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits) = self.inner(new_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
+        new_carry = TRM_carry(z_H=new_carry.z_H.detach(), z_L=new_carry.z_L.detach())
+        
         return TRM_wrapper(new_carry, new_steps, halted, new_current_data), outputs

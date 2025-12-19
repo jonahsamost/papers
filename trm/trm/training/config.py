@@ -18,7 +18,7 @@ class Config:
     forward_dtype: str = "bfloat16"
     rope_theta: float = 10000.0
     halt_max_steps: int = 16
-    no_ACT_continue: bool = True
+    no_ACT_continue: bool = False
     halt_exploration_prob: float = 0.1
 
     H_steps: int = 3

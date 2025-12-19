@@ -111,6 +111,23 @@ def train_batch(config, train_state, batch, global_batch_size: int):
         epoch = train_state.epoch
         total_epochs = train_state.total_epochs
         print(f"Step {train_state.step}/{total}, Epoch {epoch}/{total_epochs}, LR: {current_lr:.2e}")
+        
+        # Print metrics
+        count = metrics.get("count", torch.tensor(1.0)).item()
+        m_str = []
+        for k, v in metrics.items():
+            if k == "count": continue
+            val = v.item() if isinstance(v, torch.Tensor) else v
+            if "accuracy" in k:
+                m_str.append(f"{k}: {val/max(1, count):.4f}")
+            elif "loss" in k:
+                # Loss is already scaled by loss_divisor in some cases or just summed.
+                # Here we just show the raw metric value from the dictionary.
+                m_str.append(f"{k}: {val:.4f}")
+            else:
+                m_str.append(f"{k}: {val:.2f}")
+        print(f"  Metrics: {', '.join(m_str)}")
+
         if torch.cuda.is_available():
             peak_pct = (mem_peak / mem_total) * 100
             print(f"  Memory: allocated={mem_after:.1f}MB, peak={mem_peak:.1f}MB ({peak_pct:.1f}%), reserved={mem_reserved:.1f}MB, peak_reserved={mem_peak_reserved:.1f}MB, total={mem_total:.1f}MB")

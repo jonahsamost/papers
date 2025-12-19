@@ -1,5 +1,6 @@
 import os
 import math
+import logging
 
 import torch
 import torch.optim as optim
@@ -25,8 +26,22 @@ from trm.training.config import config
 LR = 1e-4
 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_type)
+
+torch._logging.set_logs(
+    recompiles=True,
+    recompiles_verbose=True,
+    graph_breaks=True,
+    dynamo=logging.INFO,
+)
+
 trm = TRM(config)
 model = ACTLossHead(trm, 'stablemax_cross_entropy').to(device)
+
+# Optional: Compile model for faster training (trades compile time for runtime speed)
+# Remove this if you don't want compilation or if you're debugging
+print("Compiling model with torch.compile...")
+model = torch.compile(model)
+print("Model compiled!")
 
 # Only preprocess data if it doesn't exist
 data_config = DataProcessConfig()
@@ -64,7 +79,6 @@ optimizer = get_optimizer(model.model, dataset_type='sudoku')
 scheduler = get_scheduler(
     optimizer, warmup_steps=2000, total_steps=TOTAL_STEPS, min_lr_ratio=0.1
 )
-iterator = get_iterator(dataloader)
 autocast_ctx = autocast(device_type=device_type , dtype=torch.bfloat16)
 train_state = TrainState(
     model=model,
@@ -80,9 +94,8 @@ train_state = TrainState(
 model.train()
 
 for epoch in range(EPOCHS):
-    try:
-        set_name, batch, global_batch_size = next(iterator)
+    train_state.epoch = epoch
+    for set_name, batch, global_batch_size in dataloader:
+        torch.compiler.cudagraph_mark_step_begin()
         train_batch(config, train_state, batch, global_batch_size)
         
-    except StopIteration:
-        break
