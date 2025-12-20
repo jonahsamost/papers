@@ -36,9 +36,13 @@ def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0, lower: float = -2
     return tensor
 
 
-def norm(x):
-    # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
+def norm(x, eps=1e-5):
+    # Functional RMSNorm with float32 accumulation for stability
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    return x.to(orig_dtype)
 
 
 def rotate_half(x: torch.Tensor):
@@ -104,9 +108,6 @@ class SelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # rms QK norm
-        q, k = norm(q), norm(k)
-
         # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
@@ -149,8 +150,9 @@ class Block(nn.Module):
         self.mlp = SwiGLU(config.n_embd, config.expansion)
     
     def forward(self, x, cos_sin):
-        x = x + self.attn(norm(x), cos_sin)
-        x = x + self.mlp(norm(x))
+        # Post-Norm style (RMSNorm after addition) for recursion stability
+        x = norm(x + self.attn(x, cos_sin))
+        x = norm(x + self.mlp(x))
         return x
 
 

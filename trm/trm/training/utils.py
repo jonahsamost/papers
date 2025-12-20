@@ -32,8 +32,7 @@ def get_optimizer(model, dataset_type="sudoku"):
         # Sudoku-Extreme / Maze-Hard
         lr_body = 1e-4      # 
         lr_embed = 1e-4     # Same as body
-        weight_decay = 1.0  # 
-    
+        weight_decay = 0.1  # Reduced from 1.0 to 0.1 for stability    
     embed_params = []
     body_params = []
     
@@ -92,6 +91,10 @@ def train_batch(config, train_state, batch, global_batch_size: int):
         train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
     ((1 / global_batch_size) * loss).backward()
+    
+    # Add gradient clipping for stability in recursive models
+    torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
+    
     train_state.optimizer.step()
     train_state.scheduler.step()
     train_state.step += 1
@@ -105,7 +108,7 @@ def train_batch(config, train_state, batch, global_batch_size: int):
         mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**2  # MB
 
     # Print memory stats (change condition to see every step: train_state.step % 1 == 0)
-    if train_state.step % 100 == 0 or train_state.step == 1:
+    if train_state.step % 10 == 0 or train_state.step == 1:
         current_lr = train_state.scheduler.get_last_lr()[0]
         total = train_state.total_steps
         epoch = train_state.epoch

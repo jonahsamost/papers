@@ -11,7 +11,7 @@ from typing import Dict
 from trm.models.layers import (
     Block, RotaryEmbedding,
     CastedLinear, CastedEmbedding, CastedSparseEmbedding,
-    trunc_normal_init_
+    trunc_normal_init_, norm
 )
 
 
@@ -77,8 +77,9 @@ class TRM_inner(nn.Module):
         )
 
         self.transformer = TRM_Blocks([ Block(config, i) for i in range(config.n_layer) ])
-        self.H_init = nn.Parameter(trunc_normal_init_(torch.empty(config.n_embd, dtype=self.forward_dtype), std=1))
-        self.L_init = nn.Parameter(trunc_normal_init_(torch.empty(config.n_embd, dtype=self.forward_dtype), std=1))
+        # Initialize with smaller std for stability
+        self.H_init = nn.Parameter(trunc_normal_init_(torch.empty(config.n_embd, dtype=self.forward_dtype), std=0.02))
+        self.L_init = nn.Parameter(trunc_normal_init_(torch.empty(config.n_embd, dtype=self.forward_dtype), std=0.02))
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -130,34 +131,40 @@ class TRM_inner(nn.Module):
         
         # Input encoding (handles puzzle embeddings if enabled)
         input_embeddings = self._input_embeddings(batch['inputs'], batch.get('puzzle_identifiers', torch.zeros(batch['inputs'].shape[0], dtype=torch.int32)))
+        # Normalize input embeddings to prevent massive variance during injection
+        input_embeddings = norm(input_embeddings)
 
         z_L, z_H = carry.z_L, carry.z_H
-        
-        # Gradient checkpointing for the training iterations to save memory
-        # Create wrapper functions that checkpoint can use
+        cos, sin = cos_sin
+
+        # 1. First H_steps-1 iterations without gradients (Stable/Fast)
+        with torch.no_grad():
+            for _ih in range(self.config.H_steps - 1):
+                for _il in range(self.config.L_steps):
+                    z_L = self.transformer(z_L, z_H + input_embeddings, cos_sin=(cos, sin))
+                z_H = self.transformer(z_H, z_L, cos_sin=(cos, sin))
+
+        # 2. Final iteration with gradients
         def transformer_block(x, y, cos, sin):
             return self.transformer(x, y, cos_sin=(cos, sin))
         
-        cos, sin = cos_sin
-        # All iterations with gradients
-        for _ih in range(self.config.H_steps):
-            for _il in range(self.config.L_steps):
-                z_L = checkpoint(
-                    transformer_block,
-                    z_L,
-                    z_H + input_embeddings,
-                    cos,
-                    sin,
-                    use_reentrant=True,
-                )
-            z_H = checkpoint(
+        for _il in range(self.config.L_steps):
+            z_L = checkpoint(
                 transformer_block,
-                z_H,
                 z_L,
+                z_H + input_embeddings,
                 cos,
                 sin,
-                use_reentrant=True,
+                use_reentrant=False,
             )
+        z_H = checkpoint(
+            transformer_block,
+            z_H,
+            z_L,
+            cos,
+            sin,
+            use_reentrant=False,
+        )
 
         new_carry = TRM_carry(z_H=z_H, z_L=z_L)
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
