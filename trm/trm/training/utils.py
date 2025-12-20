@@ -116,19 +116,24 @@ def train_batch(config, train_state, batch, global_batch_size: int):
         print(f"Step {train_state.step}/{total}, Epoch {epoch}/{total_epochs}, LR: {current_lr:.2e}")
         
         # Print metrics
-        count = metrics.get("count", torch.tensor(1.0)).item()
+        count = metrics.get("count", torch.tensor(0.0)).item()
         m_str = []
         for k, v in metrics.items():
             if k == "count": continue
             val = v.item() if isinstance(v, torch.Tensor) else v
-            if "accuracy" in k:
-                m_str.append(f"{k}: {val/max(1, count):.4f}")
-            elif "loss" in k:
-                # Loss is already scaled by loss_divisor in some cases or just summed.
-                # Here we just show the raw metric value from the dictionary.
+            
+            if count > 0:
+                if "accuracy" in k:
+                    m_str.append(f"{k}: {val/count:.4f}")
+                elif k == "steps":
+                    m_str.append(f"{k}_avg: {val/count:.2f}")
+            
+            if "loss" in k:
                 m_str.append(f"{k}: {val:.4f}")
-            else:
-                m_str.append(f"{k}: {val:.2f}")
+        
+        if count > 0:
+            m_str.append(f"halted_this_step: {int(count)}")
+            
         print(f"  Metrics: {', '.join(m_str)}")
 
         if torch.cuda.is_available():
